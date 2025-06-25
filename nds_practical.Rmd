@@ -1,0 +1,210 @@
+---
+title: "nds"
+author: "FloBu"
+date: "2025-06-25"
+output: html_document
+---
+
+```{r}
+wd_path = "C:/Users/Florian/Desktop/Uni/Master/4_Semester/Neural_Data_Science/Exercises/nds_env/data/project-03" 
+# -- In der Konsole ausführen --
+# setwd(wd_path) 
+
+```
+
+```{r setup, message=FALSE, warning=FALSE}
+library(data.table)
+
+# Define paths
+variables_path <- "../results/variables"
+figures_path <- "../results/figures"
+data_path <- "../data/project-03/"
+
+# Read metadata
+meta <- fread(file.path(data_path, "m1_patchseq_meta_data.csv"), sep = "\t")
+
+# Extract fields
+cells <- meta[["Cell"]]
+layers <- as.character(meta[["Targeted layer"]])
+cre <- meta[["Cre"]]
+
+# Yields: replace "?" with NA and convert to numeric
+yields <- meta[["Yield (pg/µl)"]]
+yields[yields == "?"] <- NA
+yields <- as.numeric(yields)
+
+# Depth: replace "Slice Lost" with NA and convert to numeric
+depth <- meta[["Soma depth (µm)"]]
+depth[depth == "Slice Lost"] <- NA
+depth <- as.numeric(depth)
+
+# Thickness: 0 → NA
+thickness <- meta[["Cortical thickness (µm)"]]
+thickness[thickness == 0] <- NA
+thickness <- as.numeric(thickness)
+
+# Traced: convert to logical
+traced <- meta[["Traced"]] == "y"
+
+# Exclusion reasons
+exclude <- as.character(meta[["Exclusion reasons"]])
+exclude[is.na(exclude)] <- ""
+
+# Mouse metadata
+mice_names <- meta[["Mouse"]]
+mice_ages <- meta[["Mouse age"]]
+
+# Clean Cre values by stripping trailing '+' or '-'
+mice_cres <- meta[["Cre"]]
+mice_cres <- sub("[+-]$", "", mice_cres)
+
+# Map mouse info into named vectors
+mice_ages_map <- setNames(mice_ages, mice_names)
+mice_cres_map <- setNames(mice_cres, mice_names)
+
+# Summary prints
+cat("Number of cells with measured depth:    ", sum(!is.na(depth)), "\n")
+cat("Number of cells with measured thickness:", sum(!is.na(thickness)), "\n")
+cat("Number of reconstructed cells:          ", sum(traced), "\n")
+
+# Slices with 2 cells
+sliceids <- meta[["Slice"]]
+slice_counts <- table(sliceids)
+stopifnot(all(slice_counts <= 2))
+cat("Number of slices with two cells:        ", sum(slice_counts == 2), "\n")
+
+# Consistency checks
+stopifnot(all(sapply(unique(mice_names), function(m) {
+  length(unique(meta[mice_names == m, Date])) == 1
+})))
+stopifnot(all(sapply(unique(mice_names), function(m) {
+  length(unique(meta[mice_names == m, `Mouse age`])) == 1
+})))
+stopifnot(all(sapply(unique(mice_names), function(m) {
+  length(unique(meta[mice_names == m, `Mouse gender`])) == 1
+})))
+stopifnot(all(sapply(unique(mice_names), function(m) {
+  length(unique(meta[mice_names == m, `Mouse genotype`])) == 1
+})))
+stopifnot(all(sapply(unique(sliceids), function(s) {
+  length(unique(meta[sliceids == s, Mouse])) == 1
+})))
+```
+
+```{r rna-filtering, message=FALSE, warning=FALSE}
+# List all columns in the metadata
+print(colnames(meta))
+
+# Filter out low quality RNA cells
+low_quality_count <- sum(meta[["RNA family"]] == "low quality")
+cat("There are", low_quality_count, "cells with low quality RNA recordings.\n")
+
+exclude_low_quality <- meta[["RNA family"]] != "low quality"
+rna_family <- meta[["RNA family"]][exclude_low_quality]
+rna_type <- meta[["RNA type"]][exclude_low_quality]
+
+# Read exon count matrix
+data_exons <- fread(file.path(data_path, "m1_patchseq_exon_counts.csv.gz"))
+gene_names <- data_exons[[1]]  # First column is rownames
+data_exons <- data_exons[, -1, with = FALSE]
+setnames(data_exons, old = names(data_exons), new = meta[["Cell"]])
+
+# Check column consistency
+stopifnot(all(meta[["Cell"]] == colnames(data_exons)))
+
+# Convert to matrix and transpose, filter low-quality cells
+exonCounts <- as.matrix(data_exons)
+exonCounts <- t(exonCounts)[exclude_low_quality, ]
+cat("Count matrix shape (exon):  ", paste(dim(exonCounts), collapse = " x "), "\n")
+
+# Read gene lengths
+gene_lengths <- fread(file.path(data_path, "gene_lengths.txt"))
+stopifnot(all(gene_lengths$GeneID == gene_names))
+exonLengths <- gene_lengths$exon_bp
+```
+
+```{r ephys-data, message=FALSE, warning=FALSE}
+# Read ephys features
+ephys_raw <- fread(file.path(data_path, "m1_patchseq_ephys_features.csv"))
+
+# Column names and cell IDs
+ephysNames <- as.character(names(ephys_raw)[-1])
+ephysCells <- ephys_raw[["cell id"]]
+
+# Convert to numeric matrix (drop cell ID column)
+ephysMatrix <- as.matrix(ephys_raw[, -1, with = FALSE])
+mode(ephysMatrix) <- "numeric"  # Ensure float type
+
+# Map each cell ID to its ephys data
+names2ephys <- setNames(split(ephysMatrix, row(ephysMatrix)), ephysCells)
+
+# Align to original `cells` vector
+# Add cell ID as a column (if not already present)
+ephys_dt <- copy(ephys_raw)
+setnames(ephys_dt, "cell id", "cell_id")
+
+# Create a reference table of all cells (full list)
+cell_dt <- data.table(cell_id = cells)
+
+# Join: left join to preserve the order and include NAs for missing cells
+ephys_joined <- merge(cell_dt, ephys_dt, by = "cell_id", all.x = TRUE, sort = FALSE)
+
+# Convert to matrix (drop cell_id)
+ephysData <- as.matrix(ephys_joined[, -1, with = FALSE])
+
+
+cat("Number of cells with ephys data:", sum(cells %in% ephysCells), "\n")
+
+# Assert that all ephys cells are in `cells`
+stopifnot(sum(!(ephysCells %in% cells)) == 0)
+
+# Features to exclude and log-transform
+features_exclude <- c(
+  "Afterdepolarization (mV)",
+  "AP Fano factor",
+  "ISI Fano factor",
+  "Latency @ +20pA current (ms)",
+  "Wildness",
+  "Spike frequency adaptation",
+  "Sag area (mV*s)",
+  "Sag time (s)",
+  "Burstiness",
+  "AP amplitude average adaptation index",
+  "ISI average adaptation index",
+  "Rebound number of APs"
+)
+features_log <- c(
+  "AP coefficient of variation",
+  "ISI coefficient of variation",
+  "ISI adaptation index",
+  "Latency (ms)"
+)
+
+# Subset to high-quality cells
+X <- ephysData[exclude_low_quality, ]
+cat("Raw ephys matrix shape (before filtering):", paste(dim(X), collapse = " x "), "\n")
+
+# Apply log-transform
+for (f in features_log) {
+  idx <- which(ephysNames == f)
+  if (length(idx) > 0) {
+    X[, idx] <- log(X[, idx])
+  }
+}
+
+# Remove excluded features
+include_cols <- !ephysNames %in% features_exclude
+X <- X[, include_cols]
+ephysNames_filtered <- ephysNames[include_cols]
+
+# Keep only rows (cells) with no all-NA
+keepcells <- !is.na(rowSums(X))
+X <- X[keepcells, ]
+cat("Filtered ephys matrix shape:", paste(dim(X), collapse = " x "), "\n")
+
+# Z-score normalization
+X <- scale(X)
+ephysData_filtered <- X
+```
+
+
